@@ -12,9 +12,9 @@
 # limitations under the License.
 # =========== Copyright 2023 @ CAMEL-AI.org. All Rights Reserved. ===========
 from .inference_manager import InferencerManager
-from .inference_thread import InferenceThread
+from .inference_thread import AsyncInferenceWorker
 
 __all__ = [
     "InferencerManager",
-    "InferenceThread",
+    "AsyncInferenceWorker",
 ]

@@ -13,9 +13,11 @@
 # =========== Copyright 2023 @ CAMEL-AI.org. All Rights Reserved. ===========
 import asyncio
 import logging
-import threading
+from typing import List, Tuple
 
-from oasis.inference.inference_thread import InferenceThread, SharedMemory
+from camel.types import ModelPlatformType
+
+from oasis.inference.inference_thread import AsyncInferenceWorker
 
 inference_log = logging.getLogger(name="inference")
 inference_log.setLevel("DEBUG")
@@ -28,80 +30,79 @@ inference_log.addHandler(file_handler)
 
 
 class InferencerManager:
-    r"""InferencerManager class to manage multiple inference threads."""
-
     def __init__(
         self,
         channel,
-        model_type,
-        model_path,
-        stop_tokens,
-        server_url,
+        model_type: str,
+        model_path: str,
+        stop_tokens: List[str],
+        server_urls: List[str],
+        max_workers: int = 20,
+        max_concurrent_per_worker: int = 5
     ):
-        self.count = 0
         self.channel = channel
-        self.threads = []
-        self.lock = threading.Lock(
-        )  # Use thread lock to protect shared resources
-        self.stop_event = threading.Event()  # Event for stopping threads
-        for url in server_url:
-            host = url["host"]
-            for port in url["ports"]:
-                _url = f"http://{host}:{port}/v1"
-                shared_memory = SharedMemory()
-                thread = InferenceThread(
-                    model_path=model_path,
-                    server_url=_url,
-                    stop_tokens=stop_tokens,
-                    model_type=model_type,
-                    temperature=0.0,
-                    shared_memory=shared_memory,
-                )
-                self.threads.append(thread)
+        self.workers = []
+        self.max_workers = max_workers
+        self.lock = asyncio.Lock()
+        self.stop_event = asyncio.Event()
+        
+        model_config = {
+            "temperature": 0.0,
+            "stop": stop_tokens,
+            "max_tokens": 2048
+        }
+        
+        for url in server_urls[:max_workers]:
+            worker = AsyncInferenceWorker(
+                server_url=url,
+                model_type=model_type,
+                model_platform_type=ModelPlatformType.VLLM,
+                model_config=model_config,
+                max_concurrent=max_concurrent_per_worker
+            )
+            self.workers.append(worker)
 
     async def run(self):
-        # Start threads
-        for thread in self.threads:
-            thread_ = threading.Thread(target=thread.run)
-            thread_.start()
-
+        consumers = [self.consume_requests(worker) for worker in self.workers]
+        sender_task = asyncio.create_task(self.send_responses())
+        
         try:
-            while not self.stop_event.is_set():
-                for thread in self.threads:
-                    # Use thread lock to protect shared state access
-                    with self.lock:
-                        if thread.shared_memory.Done:
-                            await self.channel.send_to(
-                                (thread.shared_memory.Message_ID,
-                                 thread.shared_memory.Response))
-                            thread.shared_memory.Done = False
-                            thread.shared_memory.Busy = False
-                            thread.shared_memory.Working = False
-
-                    # Check if thread is busy
-                    if not thread.shared_memory.Busy:
-                        if self.channel.receive_queue.empty():
-                            continue
-
-                        # Get new message if thread is idle
-                        message = await self.channel.receive_from()
-                        # Protect shared state update with lock
-                        with self.lock:
-                            thread.shared_memory.Message_ID = message[0]
-                            thread.shared_memory.Message = message[1]
-                            thread.shared_memory.Busy = True
-                            self.count += 1
-                            inference_log.info(
-                                f"Message {self.count} received")
-
-                # Add a reasonable sleep to avoid CPU overload
-                await asyncio.sleep(0.1)
+            await asyncio.gather(*consumers, sender_task)
         except asyncio.CancelledError:
-            inference_log.info("Inference manager run task cancelled.")
-        finally:
-            # Clean up threads before stopping
             await self.stop()
 
+    async def consume_requests(self, worker: AsyncInferenceWorker):
+        while not self.stop_event.is_set():
+            if not self.channel.receive_queue.empty():
+                message_id, message = await self.channel.receive_from()
+                task = asyncio.create_task(
+                    worker.process_request(message_id, message))
+                async with self.lock:
+                    worker.pending_tasks[message_id] = task
+            await asyncio.sleep(0.001)
+
+    async def send_responses(self):
+        while not self.stop_event.is_set():
+            for worker in self.workers:
+                done = set()
+                for msg_id, task in worker.pending_tasks.items():
+                    if task.done():
+                        try:
+                            result = await task
+                            await self.channel.send_to(result)
+                        except Exception as e:
+                            inference_log.error(f"Send response failed: {str(e)}")
+                        finally:
+                            done.add(msg_id)
+                
+                async with self.lock:
+                    for msg_id in done:
+                        del worker.pending_tasks[msg_id]
+            
+            await asyncio.sleep(0.001)
+
     async def stop(self):
-        for thread in self.threads:
-            thread.alive = False
+        self.stop_event.set()
+        for worker in self.workers:
+            while worker.pending_tasks:
+                await asyncio.sleep(0.1)
